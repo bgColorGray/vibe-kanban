@@ -280,7 +280,6 @@ pub async fn create_pr(
         target_branch
     };
 
-    // Create the git host service - auto-detects provider from repo
     let git_host_service = match git_host::create_service(&repo_path) {
         Ok(service) => service,
         Err(GitHostError::UnsupportedProvider) => {
@@ -513,7 +512,6 @@ pub async fn get_pr_comments(
         }
     };
 
-    // Create git host service - auto-detects provider
     let git_host_service = match git_host::create_service(&repo.path) {
         Ok(service) => service,
         Err(GitHostError::CliNotInstalled { provider }) => {

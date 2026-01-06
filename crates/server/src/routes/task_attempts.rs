@@ -448,7 +448,6 @@ pub async fn push_task_attempt_branch(
     let workspace_path = Path::new(&container_ref);
     let worktree_path = workspace_path.join(&repo.name);
 
-    // Create git host service and check auth
     let git_host_service = git_host::create_service(&worktree_path)?;
     git_host_service.check_auth().await?;
 
@@ -487,7 +486,6 @@ pub async fn force_push_task_attempt_branch(
     let workspace_path = Path::new(&container_ref);
     let worktree_path = workspace_path.join(&repo.name);
 
-    // Create git host service and check auth
     let git_host_service = git_host::create_service(&worktree_path)?;
     git_host_service.check_auth().await?;
 
