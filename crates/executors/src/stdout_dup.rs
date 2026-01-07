@@ -76,7 +76,59 @@ pub fn duplicate_stdout(
     Ok(Box::pin(UnboundedReceiverStream::new(dup_reader)))
 }
 
+/// Duplicate stderr from AsyncGroupChild.
+///
+/// Creates a stream that mirrors stderr of child process without consuming it.
+///
+/// # Returns
+/// A stream of `io::Result<String>` that receives a copy of all stderr data.
+pub fn duplicate_stderr(
+    child: &mut AsyncGroupChild,
+) -> Result<BoxStream<'static, std::io::Result<String>>, ExecutorError> {
+    // Take the original stderr
+    let original_stderr = child.inner().stderr.take().ok_or_else(|| {
+        ExecutorError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Child process has no stderr",
+        ))
+    })?;
+
+    // Create replacement pipe and set as new child stderr
+    let (pipe_reader, pipe_writer) = os_pipe::pipe().map_err(|e| {
+        ExecutorError::Io(std::io::Error::other(format!("Failed to create pipe: {e}")))
+    })?;
+    child.inner().stderr = Some(wrap_fd_as_child_stderr(pipe_reader)?);
+
+    // Obtain writer from fd
+    let mut fd_writer = wrap_fd_as_tokio_writer(pipe_writer)?;
+
+    // Create the duplicate stderr stream
+    let (dup_writer, dup_reader) =
+        tokio::sync::mpsc::unbounded_channel::<std::io::Result<String>>();
+
+    tokio::spawn(async move {
+        let mut stderr_stream = ReaderStream::new(original_stderr);
+
+        while let Some(res) = stderr_stream.next().await {
+            match res {
+                Ok(data) => {
+                    let _ = fd_writer.write_all(&data).await;
+
+                    let string_chunk = String::from_utf8_lossy(&data).into_owned();
+                    let _ = dup_writer.send(Ok(string_chunk));
+                }
+                Err(err) => {
+                    let _ = dup_writer.send(Err(err));
+                }
+            }
+        }
+    });
+
+    Ok(Box::pin(UnboundedReceiverStream::new(dup_reader)))
+}
+
 /// Handle to append additional lines into the child's stdout stream.
+#[derive(Clone)]
 pub struct StdoutAppender {
     tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
@@ -84,7 +136,11 @@ pub struct StdoutAppender {
 impl StdoutAppender {
     pub fn append_line<S: Into<String>>(&self, line: S) {
         // Best-effort; ignore send errors if writer task ended
-        let _ = self.tx.send(line.into());
+        let mut line = line.into();
+        while line.ends_with('\n') || line.ends_with('\r') {
+            line.pop();
+        }
+        let _ = self.tx.send(line);
     }
 }
 
@@ -178,6 +234,22 @@ pub fn create_stdout_pipe_writer<'b>(
     wrap_fd_as_tokio_writer(pipe_writer)
 }
 
+/// Create a fresh stderr pipe for the child process and return an async writer
+/// that writes directly to the child's new stderr.
+///
+/// This helper does not read or duplicate any existing stderr; it simply
+/// replaces the child's stderr with a new pipe reader and returns the
+/// corresponding async writer for the caller to write into.
+pub fn create_stderr_pipe_writer<'b>(
+    child: &mut AsyncGroupChild,
+) -> Result<impl AsyncWrite + 'b, ExecutorError> {
+    let (pipe_reader, pipe_writer) = os_pipe::pipe().map_err(|e| {
+        ExecutorError::Io(std::io::Error::other(format!("Failed to create pipe: {e}")))
+    })?;
+    child.inner().stderr = Some(wrap_fd_as_child_stderr(pipe_reader)?);
+    wrap_fd_as_tokio_writer(pipe_writer)
+}
+
 // =========================================
 // OS file descriptor helper functions
 // =========================================
@@ -202,6 +274,27 @@ fn wrap_fd_as_child_stdout(
         let owned_handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
         let std_stdout = std::process::ChildStdout::from(owned_handle);
         tokio::process::ChildStdout::from_std(std_stdout).map_err(ExecutorError::Io)
+    }
+}
+
+/// Convert os_pipe::PipeReader to tokio::process::ChildStderr
+fn wrap_fd_as_child_stderr(
+    pipe_reader: os_pipe::PipeReader,
+) -> Result<tokio::process::ChildStderr, ExecutorError> {
+    #[cfg(unix)]
+    {
+        let raw_fd = pipe_reader.into_raw_fd();
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let std_stderr = std::process::ChildStderr::from(owned_fd);
+        tokio::process::ChildStderr::from_std(std_stderr).map_err(ExecutorError::Io)
+    }
+
+    #[cfg(windows)]
+    {
+        let raw_handle = pipe_reader.into_raw_handle();
+        let owned_handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        let std_stderr = std::process::ChildStderr::from(owned_handle);
+        tokio::process::ChildStderr::from_std(std_stderr).map_err(ExecutorError::Io)
     }
 }
 
